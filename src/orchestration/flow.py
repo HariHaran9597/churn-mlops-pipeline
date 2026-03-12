@@ -1,55 +1,65 @@
-# src/orchestration/flow.py
-import sys
+"""
+MLOps Orchestration: Check drift → Retrain if needed.
+Works both as a standalone script AND with Prefect server.
+"""
+import logging
 import os
-from prefect import flow, task
-from prefect.task_runners import SequentialTaskRunner
 
-# Add path
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from src.drift.monitor import detect_drift
-from src.training.train import train_model
+USE_PREFECT = os.getenv("USE_PREFECT", "false").lower() == "true"
 
-@task
-def check_drift_task():
-    """Run the drift detection script."""
-    return detect_drift()
+if USE_PREFECT:
+    from prefect import flow, task
+else:
+    # Fallback: plain Python decorators that just run the function
+    def task(**kwargs):
+        def wrapper(fn):
+            return fn
+        return wrapper
+    def flow(**kwargs):
+        def wrapper(fn):
+            return fn
+        return wrapper
 
-@task
+
+@task(name="check_drift", retries=2, retry_delay_seconds=10)
+def check_drift_task() -> bool:
+    from src.drift.monitor import check_drift
+    return check_drift()
+
+
+@task(name="retrain_model", retries=1)
 def retrain_model_task():
-    """Run the training script."""
-    return train_model()
+    from src.training.train import train
+    train()
 
-@flow(task_runner=SequentialTaskRunner())
+
+@flow(name="churn-drift-correction-flow")
 def drift_correction_flow():
-    print("=" * 60)
-    print("Starting Drift Correction Flow...")
-    print("=" * 60)
-    
-    try:
-        # Step 1: Check for Drift
-        is_drifted = check_drift_task()
-        
-        if is_drifted:
-            print("\n" + "🚨 " * 20)
-            print("Drift Detected! Initiating Retraining Protocol...")
-            print("🚨 " * 20)
-            
-            # Step 2: Retrain Model
-            new_rmse = retrain_model_task()
-            
-            print("\n" + "=" * 60)
-            print(f"✓ Model Updated! New Accuracy (RMSE): {new_rmse:.4f}")
-            print("✓ System Self-Healed Successfully.")
-            print("=" * 60)
-        else:
-            print("\n" + "=" * 60)
-            print("✓ No Drift Detected. System Healthy.")
-            print("=" * 60)
-            
-    except Exception as e:
-        print(f"\n✗ Flow failed with error: {e}")
-        raise
+    """
+    Self-healing MLOps pipeline:
+    1. Check if incoming data has drifted from training baseline
+    2. If drift detected → retrain model automatically
+    3. New model overwrites old → next API restart loads updated model
+    """
+    logger.info("=" * 50)
+    logger.info("STARTING DRIFT CORRECTION FLOW")
+    logger.info("=" * 50)
+
+    drift_detected = check_drift_task()
+
+    if drift_detected:
+        logger.info("⚠️  DRIFT DETECTED — triggering automatic retraining...")
+        retrain_model_task()
+        logger.info("✅ Model retrained and saved successfully.")
+        logger.info("🔄 Restart API server to load new model weights.")
+    else:
+        logger.info("✅ No drift detected. Model is healthy. No action needed.")
+
+    return drift_detected
+
 
 if __name__ == "__main__":
     drift_correction_flow()

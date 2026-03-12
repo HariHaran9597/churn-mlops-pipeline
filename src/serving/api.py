@@ -1,126 +1,127 @@
-# src/serving/api.py
-import sys
+"""
+FastAPI inference endpoint for Churn Prediction.
+Logs every request to PostgreSQL for drift monitoring.
+"""
 import os
 import pickle
-import torch
-import pandas as pd
+import logging
 import numpy as np
-from fastapi import FastAPI, HTTPException
+import pandas as pd
+from fastapi import FastAPI, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 from prometheus_fastapi_instrumentator import Instrumentator
+from src.database.db import get_db, CustomerRecord, create_tables
 
-# Add project root to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from src.models.lstm import DemandLSTM
-from src.database.db import load_data
-
-# CONFIG
-MODEL_PATH = "src/models/production_model.pt"
-SCALER_PATH = "src/models/scaler.pkl"
-LOOKBACK_WINDOW = 30
-MIN_DATA_REQUIRED = LOOKBACK_WINDOW - 1
-TEMP_MIN, TEMP_MAX = 15, 35
-HUMIDITY_MIN, HUMIDITY_MAX = 30, 90
-
-app = FastAPI(title="Drift-Aware Demand Forecaster")
+app = FastAPI(title="Churn Prediction API", version="2.0")
 Instrumentator().instrument(app).expose(app)
 
-# Global variables
-model = None
-scaler = None
-model_loaded = False
+# Load model artifacts once at startup
+MODEL_PATH = os.getenv("MODEL_PATH", "src/models/churn_model.pkl")
+PREPROCESSOR_PATH = os.getenv("PREPROCESSOR_PATH", "src/models/preprocessor.pkl")
 
-class WeatherRequest(BaseModel):
-    temperature: float
-    humidity: float
+with open(MODEL_PATH, 'rb') as f:
+    model = pickle.load(f)
+with open(PREPROCESSOR_PATH, 'rb') as f:
+    preprocessor = pickle.load(f)
 
-@app.on_event("startup")
-def load_artifacts():
-    global model, scaler, model_loaded
-    print("Loading model artifacts...")
-    try:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Run training first.")
-        if not os.path.exists(SCALER_PATH):
-            raise FileNotFoundError(f"Scaler not found at {SCALER_PATH}. Run training first.")
-        
-        with open(SCALER_PATH, 'rb') as f:
-            scaler = pickle.load(f)
-        model = DemandLSTM(input_size=2, hidden_size=50)
-        model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
-        model.eval()
-        model_loaded = True
-        print("✓ System Ready! Model artifacts loaded successfully.")
-    except FileNotFoundError as fe:
-        print(f"✗ Start-up failed: {fe}")
-        model_loaded = False
-    except Exception as e:
-        print(f"✗ Start-up failed: {e}")
-        model_loaded = False
+create_tables()
+
+# ── Request Schema ─────────────────────────────────────────
+class CustomerFeatures(BaseModel):
+    gender: str = "Male"
+    SeniorCitizen: int = 0
+    Partner: str = "Yes"
+    Dependents: str = "No"
+    tenure: float = 12
+    PhoneService: str = "Yes"
+    MultipleLines: str = "No"
+    InternetService: str = "Fiber optic"
+    OnlineSecurity: str = "No"
+    OnlineBackup: str = "No"
+    DeviceProtection: str = "No"
+    TechSupport: str = "No"
+    StreamingTV: str = "No"
+    StreamingMovies: str = "No"
+    Contract: str = "Month-to-month"
+    PaperlessBilling: str = "Yes"
+    PaymentMethod: str = "Electronic check"
+    MonthlyCharges: float = 70.0
+    TotalCharges: float = 840.0
+
+def preprocess(customer: CustomerFeatures) -> pd.DataFrame:
+    data = customer.model_dump()
+    df = pd.DataFrame([data])
+    
+    # Engineer features (same as training)
+    service_cols = ['OnlineSecurity', 'OnlineBackup', 'DeviceProtection',
+                    'TechSupport', 'StreamingTV', 'StreamingMovies']
+    df['total_services'] = df[service_cols].apply(
+        lambda row: sum(v == 'Yes' for v in row), axis=1
+    )
+    df['tenure_bucket'] = pd.cut(
+        df['tenure'], bins=[0, 12, 24, 48, 72, np.inf],
+        labels=[0, 1, 2, 3, 4], include_lowest=True
+    ).astype(int)
+    df['charge_per_service'] = df['MonthlyCharges'] / (df['total_services'] + 1)
+    df['customer_value'] = df['tenure'] * df['MonthlyCharges']
+    df['has_premium'] = (df['total_services'] >= 3).astype(int)
+
+    # Apply saved encoders
+    encoders = preprocessor['encoders']
+    for col, le in encoders.items():
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+            known = set(le.classes_)
+            df[col] = df[col].apply(lambda x: x if x in known else le.classes_[0])
+            df[col] = le.transform(df[col])
+
+    # Scale numerics
+    scaler = preprocessor['scaler']
+    num_cols = preprocessor['num_cols']
+    df[num_cols] = scaler.transform(df[num_cols])
+
+    return df[preprocessor['feature_cols']]
+
+# ── Endpoints ──────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "XGBoost Churn v2.0"}
 
 @app.post("/predict")
-def predict(request: WeatherRequest):
-    global model, scaler, model_loaded
-    
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded. Check logs.")
-    
-    try:
-        # Validate input ranges
-        if not (TEMP_MIN <= request.temperature <= TEMP_MAX):
-            print(f"⚠ Temperature {request.temperature}°C outside typical range [{TEMP_MIN}-{TEMP_MAX}]")
-        if not (HUMIDITY_MIN <= request.humidity <= HUMIDITY_MAX):
-            print(f"⚠ Humidity {request.humidity}% outside typical range [{HUMIDITY_MIN}-{HUMIDITY_MAX}]")
-        
-        # 1. Fetch History
-        query = f"""
-            SELECT date, temperature, humidity 
-            FROM features 
-            ORDER BY date DESC 
-            LIMIT {MIN_DATA_REQUIRED}
-        """
-        history_df = load_data(query)
-        
-        # Check if we have enough data
-        if len(history_df) < MIN_DATA_REQUIRED:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Insufficient data: {len(history_df)}/{MIN_DATA_REQUIRED} records"
-            )
-        
-        # 2. Sort by date (Oldest first)
-        history_df = history_df.sort_values(by="date", ascending=True)
-        history_data = history_df[['temperature', 'humidity']].values
-        
-        # 3. Combine with current request
-        current_data = np.array([[request.temperature, request.humidity]])
-        full_window = np.vstack((history_data, current_data))
-        
-        # 4. Scale features only (model was trained on 2 features)
-        scaled_window = scaler.transform(np.hstack([
-            full_window,
-            np.zeros((LOOKBACK_WINDOW, 1))  # Placeholder for demand column
-        ]))[:, :2]  # Take only scaled temp/humidity
-        
-        # 5. Predict
-        input_tensor = torch.tensor(scaled_window, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            prediction_scaled = model(input_tensor).item()
-        
-        # 6. Inverse scale the prediction
-        # Create a dummy row with scaled values to inverse transform
-        dummy_scaled = np.array([[0.0, 0.0, prediction_scaled]])
-        dummy_original = scaler.inverse_transform(dummy_scaled)
-        final_prediction = max(0, dummy_original[0, 2])  # Demand should be non-negative
-        
-        return {
-            "model_version": "v1",
-            "predicted_demand": round(final_prediction, 2)
-        }
+def predict(customer: CustomerFeatures, db: Session = Depends(get_db)):
+    X = preprocess(customer)
+    prediction = int(model.predict(X)[0])
+    probability = float(model.predict_proba(X)[0][1])
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"✗ Error during prediction: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+    service_cols = ['OnlineSecurity', 'OnlineBackup', 'DeviceProtection',
+                    'TechSupport', 'StreamingTV', 'StreamingMovies']
+    total_services = sum(
+        getattr(customer, col) == 'Yes' for col in service_cols
+    )
+
+    # Log to DB for drift monitoring
+    record = CustomerRecord(
+        tenure=customer.tenure,
+        monthly_charges=customer.MonthlyCharges,
+        total_charges=customer.TotalCharges,
+        contract=customer.Contract,
+        payment_method=customer.PaymentMethod,
+        internet_service=customer.InternetService,
+        total_services=total_services,
+        customer_value=customer.tenure * customer.MonthlyCharges,
+        churn_prediction=prediction,
+        churn_probability=probability
+    )
+    db.add(record)
+    db.commit()
+
+    return {
+        "churn_prediction": prediction,
+        "churn_label": "CHURN" if prediction == 1 else "RETAIN",
+        "churn_probability": round(probability, 4),
+        "risk_tier": "HIGH" if probability > 0.7 else "MEDIUM" if probability > 0.4 else "LOW"
+    }

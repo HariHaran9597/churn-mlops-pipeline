@@ -1,82 +1,65 @@
-# scripts/generate_traffic.py
-#!/usr/bin/env python3
-# scripts/generate_traffic.py
-import requests
-import time
+"""
+Generates fake customer traffic to test drift detection.
+"""
 import random
-import sys
-from datetime import datetime
+import argparse
+import httpx
+import time
+import logging
 
-URL = "http://localhost:8000/predict"
-TEMP_MIN, TEMP_MAX = 20, 45
-HUMIDITY_MIN, HUMIDITY_MAX = 30, 90
-REQUEST_INTERVAL = 0.5  # 2 requests per second
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def send_traffic():
-    print(f"{'='*60}")
-    print(f"Traffic Generator Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Target: {URL}")
-    print(f"Rate: {1/REQUEST_INTERVAL:.1f} requests/sec")
-    print(f"Temperature Range: {TEMP_MIN}-{TEMP_MAX}°C")
-    print(f"Humidity Range: {HUMIDITY_MIN}-{HUMIDITY_MAX}%")
-    print(f"{'='*60}")
-    print("Press CTRL+C to stop.\n")
-    
-    count = 0
-    errors = 0
-    start_time = time.time()
-    
-    while True:
-        try:
-            # Random weather data
-            payload = {
-                "temperature": random.uniform(TEMP_MIN, TEMP_MAX),
-                "humidity": random.uniform(HUMIDITY_MIN, HUMIDITY_MAX)
-            }
-            
-            response = requests.post(URL, json=payload, timeout=5)
-            
-            if response.status_code == 200:
-                pred = response.json()['predicted_demand']
-                elapsed = time.time() - start_time
-                success_rate = ((count - errors) / max(1, count)) * 100
-                sys.stdout.write(
-                    f"\r[{elapsed:7.1f}s] Req #{count}: Demand={pred:7.2f} | "
-                    f"Success={success_rate:.1f}% ({count-errors}/{count})"
-                )
-                sys.stdout.flush()
-            else:
-                errors += 1
-                print(f"\n✗ Error {response.status_code}: {response.text[:100]}")
-                
-            count += 1
-            time.sleep(REQUEST_INTERVAL)
-            
-        except requests.exceptions.Timeout:
-            errors += 1
-            print(f"\n✗ Timeout: Request took >5 seconds")
-            time.sleep(2)
-        except requests.exceptions.ConnectionError as ce:
-            errors += 1
-            print(f"\n✗ Connection Error: {str(ce)[:100]}")
-            print("  → Is the API running? Try: docker-compose up -d")
-            time.sleep(3)
-        except KeyboardInterrupt:
-            print(f"\n\n{'='*60}")
-            print(f"Traffic Generator Stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            elapsed = time.time() - start_time
-            print(f"Total Requests: {count}")
-            print(f"Successful: {count - errors}")
-            print(f"Failed: {errors}")
-            print(f"Success Rate: {((count-errors)/max(1,count))*100:.1f}%")
-            print(f"Duration: {elapsed:.1f}s")
-            print(f"Avg Rate: {count/elapsed:.2f} req/s")
-            print(f"{'='*60}")
-            break
-        except Exception as e:
-            errors += 1
-            print(f"\n✗ Unexpected error: {str(e)[:100]}")
-            time.sleep(2)
+API_URL = "http://localhost:8000/predict"
+
+def normal_customer() -> dict:
+    return {
+        "gender": random.choice(["Male", "Female"]),
+        "SeniorCitizen": random.choices([0, 1], weights=[84, 16])[0],
+        "Partner": random.choice(["Yes", "No"]),
+        "Dependents": random.choice(["Yes", "No"]),
+        "tenure": random.randint(1, 72),
+        "PhoneService": random.choice(["Yes", "No"]),
+        "MultipleLines": random.choice(["Yes", "No", "No phone service"]),
+        "InternetService": random.choices(["DSL", "Fiber optic", "No"], weights=[34, 44, 22])[0],
+        "OnlineSecurity": random.choice(["Yes", "No", "No internet service"]),
+        "OnlineBackup": random.choice(["Yes", "No", "No internet service"]),
+        "DeviceProtection": random.choice(["Yes", "No", "No internet service"]),
+        "TechSupport": random.choice(["Yes", "No", "No internet service"]),
+        "StreamingTV": random.choice(["Yes", "No", "No internet service"]),
+        "StreamingMovies": random.choice(["Yes", "No", "No internet service"]),
+        "Contract": random.choices(["Month-to-month", "One year", "Two year"], weights=[55, 21, 24])[0],
+        "PaperlessBilling": random.choice(["Yes", "No"]),
+        "PaymentMethod": random.choice(["Electronic check", "Mailed check", "Bank transfer (automatic)", "Credit card (automatic)"]),
+        "MonthlyCharges": round(random.uniform(18, 120), 2),
+        "TotalCharges": round(random.uniform(18, 8000), 2),
+    }
+
+def drifted_customer() -> dict:
+    customer = normal_customer()
+    customer["Contract"] = "Month-to-month"
+    customer["InternetService"] = "Fiber optic"
+    customer["MonthlyCharges"] = round(random.uniform(90, 120), 2)
+    return customer
+
+def run(mode: str, n: int = 60):
+    logger.info(f"Sending {n} requests in '{mode}' mode...")
+    with httpx.Client(timeout=10) as client:
+        for i in range(n):
+            customer = drifted_customer() if mode == "drift" else normal_customer()
+            try:
+                resp = client.post(API_URL, json=customer)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if i % 10 == 0:
+                        logger.info(f"Req {i+1}: {result['churn_label']} (p={result['churn_probability']:.3f})")
+            except Exception as e:
+                logger.error(f"Error {i+1}: {e}")
+            time.sleep(0.1)
 
 if __name__ == "__main__":
-    send_traffic()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["normal", "drift"], default="normal")
+    parser.add_argument("--n", type=int, default=60)
+    args = parser.parse_args()
+    run(args.mode, args.n)
