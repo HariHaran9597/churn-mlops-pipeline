@@ -8,8 +8,11 @@ data/
 *.csv
 *.json
 
-# Environment variables (Security)
+# Environment variables (Security — use .env.example as template)
 .env
+
+# MLflow experiment tracking (local runs)
+mlruns/
 
 # Mac/Windows OS files
 .DS_Store

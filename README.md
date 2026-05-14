@@ -34,7 +34,7 @@ Telecom companies lose **$65B annually** to customer churn. A static ML model de
 
 **This project solves two problems:**
 1. **Churn Prediction** — Identify at-risk customers before they leave using XGBoost with SMOTE for class imbalance
-2. **Model Reliability** — Automatically detect when production data drifts from training data and retrain the model without human intervention
+2. **Model Reliability** — Automatically detect when production data drifts from training data and retrain the model. Retraining saves a new model artifact; an API restart loads the latest version.
 
 ---
 
@@ -179,7 +179,10 @@ churn-mlops-pipeline/
 git clone https://github.com/HariHaran9597/churn-mlops-pipeline.git
 cd churn-mlops-pipeline
 
-# Train the model (generates churn_model.pkl)
+# Set up environment variables
+cp .env.example .env   # Edit .env if you need custom credentials
+
+# Train the model (generates churn_model.pkl + logs to MLflow)
 pip install -r requirements.txt
 python src/training/train.py
 
@@ -231,9 +234,16 @@ docker exec -it drift_ml_app python -m src.orchestration.flow
 STARTING DRIFT CORRECTION FLOW
 Drift detected: True | Drifted columns: 6/6 (share: 100.0%)
 ⚠️  DRIFT DETECTED — triggering automatic retraining...
-Training Complete. AUC: 0.8344 | F1: 0.6249
+Training Complete. AUC: 0.8344 | F1: 0.6249 | Recall: 0.8150
 ✅ Model retrained and saved successfully.
+✅ MLflow run logged to experiment 'churn-xgboost'
+🔄 Restart API server to load new model weights.
 ```
+
+> **Note:** Retraining saves a new `churn_model.pkl` artifact to disk. The API loads the model once at startup, so a container restart is required to serve the updated model:
+> ```bash
+> docker-compose restart ml-app
+> ```
 
 ---
 
@@ -388,6 +398,7 @@ After running `monitor.py`, a comprehensive HTML drift report is saved to `monit
 - [ ] Implement A/B testing between old and retrained models
 - [ ] Add Prefect scheduled deployments (e.g., drift check every 6 hours)
 - [ ] Add model versioning with MLflow Model Registry
+- [ ] Hot-reload model artifacts at runtime (avoid API restart after retraining)
 - [ ] Deploy FastAPI on cloud (AWS ECS / GCP Cloud Run)
 
 ---

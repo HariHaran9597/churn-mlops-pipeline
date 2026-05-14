@@ -1,59 +1,89 @@
 # scripts/populate_db.py
-import pandas as pd
-import numpy as np
+"""
+Seeds the PostgreSQL database with customer records from the telco churn dataset.
+This provides a baseline of production-like data for drift monitoring.
+
+Usage:
+    docker exec -it drift_ml_app python scripts/populate_db.py
+    # or locally:
+    python scripts/populate_db.py
+"""
 import sys
 import os
+import random
+import logging
 
-# Add the project root to Python path so we can import src
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from src.database.db import save_data
+# Add project root to path
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-def generate_weather_data(start_date="2022-01-01", end_date="2024-01-01"):
+from src.database.db import engine, create_tables, CustomerRecord, SessionLocal
+
+DATA_PATH = os.getenv("DATA_PATH", "data/telco_churn.csv")
+SEED_COUNT = 200  # Number of records to seed
+
+
+def seed_from_csv(path: str, n: int = SEED_COUNT):
     """
-    Generates synthetic weather and demand data.
-    Logic:
-    - Temperature: Sine wave to simulate seasonality (Summer/Winter).
-    - Humidity: Inverse of temp + monsoon spikes.
-    - Demand: Correlated with Temp (Higher temp = Higher demand).
+    Reads the telco churn CSV and inserts N sampled records into the
+    customer_records table — the same table the /predict endpoint logs to.
+    This gives drift monitoring a baseline of realistic production data.
     """
-    print("Generating synthetic data...")
-    
-    dates = pd.date_range(start=start_date, end=end_date, freq="D")
-    n = len(dates)
-    
-    # 1. Synthetic Temperature (Seasonality: Sin wave)
-    # Base of 25 degrees, amplitude of 10 (ranges 15-35), plus noise
-    t = np.linspace(0, 4 * np.pi, n) # 2 years = 2 cycles
-    temperature = 25 + 10 * np.sin(t) + np.random.normal(0, 2, n)
-    
-    # 2. Synthetic Humidity
-    # Roughly inverse to temp, but random
-    humidity = 60 - 10 * np.cos(t) + np.random.normal(0, 5, n)
-    
-    # 3. Synthetic Demand (The Target Variable)
-    # Formula: Demand = 100 + (Temp * 3) + (Humidity * 0.5) + Noise
-    demand = 100 + (temperature * 3) + (humidity * 0.5) + np.random.normal(0, 5, n)
-    
-    df = pd.DataFrame({
-        "date": dates,
-        "temperature": temperature,
-        "humidity": humidity,
-        "demand": demand,
-        "is_drifted": 0  # Flag to mark normal data
-    })
-    
-    return df
+    import pandas as pd
+
+    if not os.path.exists(path):
+        logger.error(f"Dataset not found at '{path}'. "
+                     f"Make sure telco_churn.csv is in the data/ directory.")
+        sys.exit(1)
+
+    df = pd.read_csv(path)
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce").fillna(0)
+
+    # Sample N records
+    sample = df.sample(n=min(n, len(df)), random_state=42)
+
+    service_cols = [
+        "OnlineSecurity", "OnlineBackup", "DeviceProtection",
+        "TechSupport", "StreamingTV", "StreamingMovies",
+    ]
+
+    create_tables()
+    db = SessionLocal()
+
+    try:
+        inserted = 0
+        for _, row in sample.iterrows():
+            total_services = sum(row[col] == "Yes" for col in service_cols)
+            customer_value = row["tenure"] * row["MonthlyCharges"]
+
+            record = CustomerRecord(
+                tenure=float(row["tenure"]),
+                monthly_charges=float(row["MonthlyCharges"]),
+                total_charges=float(row["TotalCharges"]),
+                contract=row["Contract"],
+                payment_method=row["PaymentMethod"],
+                internet_service=row["InternetService"],
+                total_services=total_services,
+                customer_value=customer_value,
+                churn_prediction=1 if row["Churn"] == "Yes" else 0,
+                churn_probability=round(random.uniform(0.3, 0.9), 4)
+                if row["Churn"] == "Yes"
+                else round(random.uniform(0.05, 0.4), 4),
+            )
+            db.add(record)
+            inserted += 1
+
+        db.commit()
+        logger.info(f"✓ Seeded {inserted} customer records into PostgreSQL.")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"✗ Failed to seed database: {e}")
+        sys.exit(1)
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
-    # Generate 2 years of data
-    data = generate_weather_data()
-    
-    # Save to Postgres
-    print("Pushing data to Postgres...")
-    try:
-        save_data(data, "features", if_exists='replace')
-        print(f"✓ Database successfully populated with {len(data)} historical records!")
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        sys.exit(1)
+    seed_from_csv(DATA_PATH)
