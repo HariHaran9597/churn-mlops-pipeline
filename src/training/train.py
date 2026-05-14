@@ -179,11 +179,15 @@ def train():
         mlflow.log_metrics(metrics)
 
         # Log the XGBoost model
-        mlflow.sklearn.log_model(model, artifact_path="xgboost-churn-model")
+        try:
+            mlflow.sklearn.log_model(model, name="xgboost-churn-model")
+        except TypeError:
+            # Fallback for older MLflow versions
+            mlflow.sklearn.log_model(model, artifact_path="xgboost-churn-model")
 
         # Log pickle artifacts for reproducibility
-        mlflow.log_artifact(MODEL_PATH, artifact_path="pickle_artifacts")
-        mlflow.log_artifact(PREPROCESSOR_PATH, artifact_path="pickle_artifacts")
+        mlflow.log_artifact(MODEL_PATH)
+        mlflow.log_artifact(PREPROCESSOR_PATH)
 
         logger.info(f"✅ MLflow run logged to experiment '{MLFLOW_EXPERIMENT}'")
 
